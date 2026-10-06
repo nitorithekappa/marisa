@@ -1,0 +1,15 @@
+{
+  "name": "discord-voice-ranking",
+  "version": "1.0.0",
+  "description": "Bot que ranqueia o tempo de vida em grupo de calls de voz",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.6.1",
+    "node-cron": "^3.0.3"
+  }
+}
