@@ -14,7 +14,9 @@ const TOKEN = process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID; // servidor onde os comandos serão registrados
 const RANKING_CHANNEL_ID = process.env.RANKING_CHANNEL_ID; // chat do ranking semanal
 const MIN_MEMBERS = parseInt(process.env.MIN_MEMBERS || '2', 10); // pessoas mínimas para a sessão contar
-const RANKING_CRON = process.env.RANKING_CRON || '0 12 * * 1'; // segunda 12:00
+const WEEK_RESET_DAY = parseInt(process.env.WEEK_RESET_DAY || '4', 10); // 0=domingo ... 4=quinta
+const WEEK_RESET_HOUR = parseInt(process.env.WEEK_RESET_HOUR || '10', 10); // semana vira às 10:00
+const RANKING_CRON = `0 ${WEEK_RESET_HOUR} * * ${WEEK_RESET_DAY}`; // envio do ranking semanal
 const TIMEZONE = process.env.TIMEZONE || 'America/Sao_Paulo';
 const SHOW_CHANNEL = process.env.SHOW_CHANNEL === 'true'; // mostra o nome do canal no ranking
 const TOP_WEEKLY = 10;
@@ -63,6 +65,13 @@ const touchActive = db.prepare(`UPDATE active_sessions SET heartbeat_ms = ? WHER
 const topSessions = db.prepare(
   `SELECT channel_id, duration_ms, members FROM sessions
    WHERE guild_id = ? ORDER BY duration_ms DESC LIMIT ?`
+);
+// conta só a parte de cada sessão que caiu dentro do período [from, to)
+const topSessionsBetween = db.prepare(
+  `SELECT channel_id, members, MIN(end_ms, @to) - MAX(start_ms, @from) AS duration_ms
+   FROM sessions
+   WHERE guild_id = @guild AND end_ms > @from AND start_ms < @to
+   ORDER BY duration_ms DESC LIMIT @limit`
 );
 
 // ───────────── Sessões em memória ─────────────
@@ -126,8 +135,40 @@ function formatMembers(ids) {
   return extra > 0 ? `${shown} +${extra}` : shown;
 }
 
-function buildRankingEmbed(guildId, limit = 10) {
-  const entries = topSessions.all(guildId, limit).map((r) => ({
+// Início da semana atual: último WEEK_RESET_DAY às WEEK_RESET_HOUR no fuso TIMEZONE
+function weekStart(nowMs = Date.now()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: TIMEZONE,
+      year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', second: 'numeric',
+      weekday: 'short', hourCycle: 'h23',
+    })
+      .formatToParts(new Date(nowMs))
+      .map((p) => [p.type, p.value])
+  );
+  const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday);
+  const y = +parts.year, mo = +parts.month - 1, d = +parts.day;
+  const localAsUtc = Date.UTC(y, mo, d, +parts.hour, +parts.minute, +parts.second);
+  const offset = localAsUtc - Math.floor(nowMs / 1000) * 1000; // diferença do fuso para UTC
+
+  let daysBack = (weekday - WEEK_RESET_DAY + 7) % 7;
+  if (daysBack === 0 && +parts.hour < WEEK_RESET_HOUR) daysBack = 7;
+  return Date.UTC(y, mo, d - daysBack, WEEK_RESET_HOUR) - offset;
+}
+
+function formatDate(ms) {
+  return new Date(ms).toLocaleString('pt-BR', {
+    timeZone: TIMEZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// period: undefined = all time, ou { from, to } em ms
+function buildRankingEmbed(guildId, limit = 10, period) {
+  const rows = period
+    ? topSessionsBetween.all({ guild: guildId, from: period.from, to: period.to, limit })
+    : topSessions.all(guildId, limit);
+  const entries = rows.map((r) => ({
     channelId: r.channel_id,
     duration: r.duration_ms,
     members: JSON.parse(r.members),
@@ -135,15 +176,13 @@ function buildRankingEmbed(guildId, limit = 10) {
   }));
 
   // inclui calls em andamento (de todos os canais)
+  const now = Date.now();
   for (const [channelId, s] of active.entries()) {
-    if (s.guildId === guildId) {
-      entries.push({
-        channelId,
-        duration: Date.now() - s.start,
-        members: [...s.members],
-        live: true,
-      });
-    }
+    if (s.guildId !== guildId) continue;
+    const start = period ? Math.max(s.start, period.from) : s.start;
+    const end = period ? Math.min(now, period.to) : now;
+    if (end - start <= 0) continue;
+    entries.push({ channelId, duration: end - start, members: [...s.members], live: true });
   }
 
   entries.sort((a, b) => b.duration - a.duration);
@@ -160,13 +199,18 @@ function buildRankingEmbed(guildId, limit = 10) {
           return `${pos} ${formatMembers(e.members)}${where} — **${formatDuration(e.duration)}**${live}`;
         })
         .join('\n')
-    : 'Nenhuma call registrada ainda.';
+    : period
+      ? 'Nenhuma call registrada nesta semana.'
+      : 'Nenhuma call registrada ainda.';
 
+  const footer = `Conta apenas calls com ${MIN_MEMBERS}+ pessoas juntas`;
   return new EmbedBuilder()
-    .setTitle('🏆 Ranking de calls (all time)')
+    .setTitle(period ? '📅 Ranking de calls (semanal)' : '🏆 Ranking de calls (all time)')
     .setDescription(description)
-    .setFooter({ text: `Conta apenas calls com ${MIN_MEMBERS}+ pessoas juntas` })
-    .setColor(0x5865f2)
+    .setFooter({
+      text: period ? `${formatDate(period.from)} até ${formatDate(period.to)} • ${footer}` : footer,
+    })
+    .setColor(period ? 0x57f287 : 0x5865f2)
     .setTimestamp();
 }
 
@@ -174,8 +218,11 @@ async function sendWeeklyRanking() {
   try {
     const channel = await client.channels.fetch(RANKING_CHANNEL_ID);
     if (!channel || !channel.isTextBased()) throw new Error('Canal inválido');
+    // semana que acabou de fechar: da virada anterior até agora
+    const now = Date.now();
+    const period = { from: weekStart(now - 60 * 1000), to: now };
     await channel.send({
-      embeds: [buildRankingEmbed(channel.guild.id, TOP_WEEKLY)],
+      embeds: [buildRankingEmbed(channel.guild.id, TOP_WEEKLY, period)],
       allowedMentions: { parse: [] }, // menciona sem notificar
     });
   } catch (err) {
@@ -194,7 +241,13 @@ client.once(Events.ClientReady, async () => {
   // Registra o comando /ranking
   const command = new SlashCommandBuilder()
     .setName('ranking')
-    .setDescription('Mostra o ranking all time de maior tempo em call')
+    .setDescription('Mostra o ranking de maior tempo em call')
+    .addStringOption((o) =>
+      o
+        .setName('periodo')
+        .setDescription('Semana atual ou all time (padrão: all time)')
+        .addChoices({ name: 'semanal', value: 'semanal' }, { name: 'all time', value: 'alltime' })
+    )
     .addIntegerOption((o) =>
       o.setName('limite').setDescription('Quantas posições mostrar (1-25)').setMinValue(1).setMaxValue(25)
     )
@@ -247,8 +300,10 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'ranking') return;
   const limit = interaction.options.getInteger('limite') ?? 10;
+  const weekly = interaction.options.getString('periodo') === 'semanal';
+  const period = weekly ? { from: weekStart(), to: Date.now() } : undefined;
   await interaction.reply({
-    embeds: [buildRankingEmbed(interaction.guildId, limit)],
+    embeds: [buildRankingEmbed(interaction.guildId, limit, period)],
     allowedMentions: { parse: [] },
   });
 });
