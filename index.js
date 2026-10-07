@@ -25,6 +25,9 @@ const WEEK_RESET_HOUR = parseInt(process.env.WEEK_RESET_HOUR || '10', 10); // se
 const RANKING_CRON = `0 ${WEEK_RESET_HOUR} * * ${WEEK_RESET_DAY}`; // envio do ranking semanal
 const TIMEZONE = process.env.TIMEZONE || 'America/Sao_Paulo';
 const SHOW_CHANNEL = process.env.SHOW_CHANNEL === 'true'; // mostra o nome do canal no ranking
+const IGNORED_CHANNEL_IDS = new Set(
+  (process.env.IGNORED_CHANNEL_IDS || '').split(',').map((id) => id.trim()).filter(Boolean)
+); // canais de voz que nunca contam (separados por vírgula)
 const TOP_WEEKLY = 10;
 const MIN_SESSION_MS = 60 * 1000; // ignora sessões com menos de 1 minuto
 const MIN_MEMBER_MINUTES = parseInt(process.env.MIN_MEMBER_MINUTES || '30', 10);
@@ -133,6 +136,7 @@ function endSession(channelId, endMs = Date.now()) {
 function updateChannel(channel) {
   if (!channel || !channel.isVoiceBased()) return;
   if (channel.id === channel.guild.afkChannelId) return; // ignora canal AFK
+  if (IGNORED_CHANNEL_IDS.has(channel.id)) return;
 
   const humans = channel.members.filter((m) => !m.user.bot);
   let s = active.get(channel.id);
