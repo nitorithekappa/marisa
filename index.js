@@ -5,7 +5,13 @@ const {
   EmbedBuilder,
   SlashCommandBuilder,
   Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  MessageFlags,
+  PermissionFlagsBits,
 } = require('discord.js');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const cron = require('node-cron');
 
@@ -63,6 +69,7 @@ const upsertActive = db.prepare(
    ON CONFLICT(channel_id) DO UPDATE SET members = excluded.members, heartbeat_ms = excluded.heartbeat_ms`
 );
 const deleteActive = db.prepare(`DELETE FROM active_sessions WHERE channel_id = ?`);
+const deleteGuildSessions = db.prepare(`DELETE FROM sessions WHERE guild_id = ?`);
 const touchActive = db.prepare(`UPDATE active_sessions SET heartbeat_ms = ? WHERE channel_id = ?`);
 const topSessions = db.prepare(
   `SELECT channel_id, duration_ms, members FROM sessions
@@ -263,6 +270,23 @@ async function sendWeeklyRanking() {
   }
 }
 
+// Apaga o ranking do servidor (all time e semanal) e recomeça as calls em andamento do zero.
+// Antes, salva uma cópia do banco em backups/ para poder desfazer.
+async function resetRanking(guild) {
+  fs.mkdirSync('backups', { recursive: true });
+  const backupPath = `backups/ranking-${new Date().toISOString().replace(/[:.]/g, '-')}.db`;
+  await db.backup(backupPath);
+
+  const { changes } = deleteGuildSessions.run(guild.id);
+  for (const [channelId, s] of active) {
+    if (s.guildId !== guild.id) continue;
+    active.delete(channelId);
+    deleteActive.run(channelId);
+  }
+  guild.channels.cache.filter((c) => c.isVoiceBased()).forEach(updateChannel);
+  return { removed: changes, backupPath };
+}
+
 // ───────────── Cliente Discord ─────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -271,8 +295,8 @@ const client = new Client({
 client.once(Events.ClientReady, async () => {
   console.log(`Logado como ${client.user.tag}`);
 
-  // Registra o comando /ranking
-  const command = new SlashCommandBuilder()
+  // Registra os comandos /ranking e /resetar-ranking
+  const rankingCommand = new SlashCommandBuilder()
     .setName('ranking')
     .setDescription('Mostra o ranking de maior tempo em call')
     .addStringOption((o) =>
@@ -285,11 +309,17 @@ client.once(Events.ClientReady, async () => {
       o.setName('limite').setDescription('Quantas posições mostrar (1-25)').setMinValue(1).setMaxValue(25)
     )
     .toJSON();
+  const resetCommand = new SlashCommandBuilder()
+    .setName('resetar-ranking')
+    .setDescription('Apaga todo o ranking (all time e semanal) deste servidor')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .toJSON();
+  const commands = [rankingCommand, resetCommand];
 
   if (GUILD_ID) {
-    await client.guilds.cache.get(GUILD_ID)?.commands.set([command]);
+    await client.guilds.cache.get(GUILD_ID)?.commands.set(commands);
   } else {
-    await client.application.commands.set([command]);
+    await client.application.commands.set(commands);
   }
 
   // Recupera sessões que estavam abertas quando o bot caiu
@@ -330,8 +360,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   if (newState.channelId !== oldState.channelId) updateChannel(newState.channel);
 });
 
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'ranking') return;
+async function handleRanking(interaction) {
   const limit = interaction.options.getInteger('limite') ?? 10;
   const weekly = interaction.options.getString('periodo') === 'semanal';
   const period = weekly ? { from: weekStart(), to: Date.now() } : undefined;
@@ -339,6 +368,59 @@ client.on(Events.InteractionCreate, async (interaction) => {
     embeds: [buildRankingEmbed(interaction.guildId, limit, period)],
     allowedMentions: { parse: [] },
   });
+}
+
+async function handleReset(interaction) {
+  if (!interaction.inGuild() || !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({ content: 'Só administradores podem resetar o ranking.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('reset-confirm').setLabel('Apagar ranking').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('reset-cancel').setLabel('Cancelar').setStyle(ButtonStyle.Secondary)
+  );
+  const response = await interaction.reply({
+    content:
+      '⚠️ Isso apaga **todo o ranking** deste servidor (all time e semanal) e recomeça do zero as calls em andamento. Tem certeza?',
+    components: [buttons],
+    flags: MessageFlags.Ephemeral,
+    withResponse: true,
+  });
+
+  let click;
+  try {
+    click = await response.resource.message.awaitMessageComponent({
+      filter: (i) => i.user.id === interaction.user.id,
+      time: 30_000,
+    });
+  } catch {
+    await interaction.editReply({ content: 'Tempo esgotado, nada foi apagado.', components: [] });
+    return;
+  }
+
+  if (click.customId !== 'reset-confirm') {
+    await click.update({ content: 'Cancelado, nada foi apagado.', components: [] });
+    return;
+  }
+
+  try {
+    const { removed, backupPath } = await resetRanking(interaction.guild);
+    console.log(`Ranking resetado por ${interaction.user.tag} (${removed} calls). Backup: ${backupPath}`);
+    await click.update({
+      content: `🗑️ Ranking resetado: ${removed} call(s) apagada(s). Um backup foi salvo no servidor do bot.`,
+      components: [],
+    });
+  } catch (err) {
+    console.error('Erro ao resetar ranking:', err);
+    await click.update({ content: 'Erro ao resetar o ranking, nada foi apagado.', components: [] });
+  }
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === 'ranking') await handleRanking(interaction);
+  else if (interaction.commandName === 'resetar-ranking') await handleReset(interaction);
 });
 
 client.login(TOKEN);
