@@ -21,6 +21,8 @@ const TIMEZONE = process.env.TIMEZONE || 'America/Sao_Paulo';
 const SHOW_CHANNEL = process.env.SHOW_CHANNEL === 'true'; // mostra o nome do canal no ranking
 const TOP_WEEKLY = 10;
 const MIN_SESSION_MS = 60 * 1000; // ignora sessões com menos de 1 minuto
+const MIN_MEMBER_MINUTES = parseInt(process.env.MIN_MEMBER_MINUTES || '30', 10);
+const MIN_MEMBER_MS = MIN_MEMBER_MINUTES * 60 * 1000; // tempo mínimo de cada pessoa na call para contar
 const RESUME_WINDOW_MS = 5 * 60 * 1000; // retoma sessão se o bot voltou em até 5 min
 
 if (!TOKEN) {
@@ -75,28 +77,47 @@ const topSessionsBetween = db.prepare(
 );
 
 // ───────────── Sessões em memória ─────────────
-// channelId -> { guildId, start, members:Set<userId> }
+// channelId -> { guildId, start, members:Map<userId, { ms, since }> }
+// ms = tempo acumulado na call; since = desde quando está na call agora (null se saiu)
 const active = new Map();
+
+function serializeMembers(members) {
+  return JSON.stringify(Object.fromEntries(members));
+}
+
+function parseMembers(json, fallbackStart) {
+  const data = JSON.parse(json);
+  // formato antigo: lista de ids, sem tempo por pessoa
+  if (Array.isArray(data)) return new Map(data.map((id) => [id, { ms: 0, since: fallbackStart }]));
+  return new Map(Object.entries(data));
+}
+
+function memberTime(m, at) {
+  return m.ms + (m.since !== null ? at - m.since : 0);
+}
+
+// ids de quem ficou pelo menos MIN_MEMBER_MS na call, do maior tempo para o menor
+function qualifiedMembers(s, at) {
+  return [...s.members]
+    .map(([id, m]) => [id, memberTime(m, at)])
+    .filter(([, ms]) => ms >= MIN_MEMBER_MS)
+    .sort((a, b) => b[1] - a[1])
+    .map(([id]) => id);
+}
 
 function persistActive(channelId) {
   const s = active.get(channelId);
   if (!s) return;
-  upsertActive.run(channelId, s.guildId, s.start, JSON.stringify([...s.members]), Date.now());
+  upsertActive.run(channelId, s.guildId, s.start, serializeMembers(s.members), Date.now());
 }
 
 function endSession(channelId, endMs = Date.now()) {
   const s = active.get(channelId);
   if (!s) return;
   const duration = endMs - s.start;
-  if (duration >= MIN_SESSION_MS) {
-    insertSession.run(
-      s.guildId,
-      channelId,
-      s.start,
-      endMs,
-      duration,
-      JSON.stringify([...s.members])
-    );
+  const members = qualifiedMembers(s, endMs);
+  if (duration >= MIN_SESSION_MS && members.length >= MIN_MEMBERS) {
+    insertSession.run(s.guildId, channelId, s.start, endMs, duration, JSON.stringify(members));
   }
   active.delete(channelId);
   deleteActive.run(channelId);
@@ -110,11 +131,22 @@ function updateChannel(channel) {
   let s = active.get(channel.id);
 
   if (humans.size >= MIN_MEMBERS) {
+    const now = Date.now();
     if (!s) {
-      s = { guildId: channel.guild.id, start: Date.now(), members: new Set() };
+      s = { guildId: channel.guild.id, start: now, members: new Map() };
       active.set(channel.id, s);
     }
-    humans.forEach((m) => s.members.add(m.id));
+    humans.forEach((m) => {
+      const entry = s.members.get(m.id);
+      if (!entry) s.members.set(m.id, { ms: 0, since: now });
+      else if (entry.since === null) entry.since = now; // voltou para a call
+    });
+    for (const [id, entry] of s.members) {
+      if (entry.since !== null && !humans.has(id)) {
+        entry.ms += now - entry.since; // saiu da call
+        entry.since = null;
+      }
+    }
     persistActive(channel.id);
   } else if (s) {
     endSession(channel.id);
@@ -181,8 +213,9 @@ function buildRankingEmbed(guildId, limit = 10, period) {
     if (s.guildId !== guildId) continue;
     const start = period ? Math.max(s.start, period.from) : s.start;
     const end = period ? Math.min(now, period.to) : now;
-    if (end - start <= 0) continue;
-    entries.push({ channelId, duration: end - start, members: [...s.members], live: true });
+    const members = qualifiedMembers(s, now);
+    if (end - start <= 0 || members.length < MIN_MEMBERS) continue;
+    entries.push({ channelId, duration: end - start, members, live: true });
   }
 
   entries.sort((a, b) => b.duration - a.duration);
@@ -203,7 +236,7 @@ function buildRankingEmbed(guildId, limit = 10, period) {
       ? 'Nenhuma call registrada nesta semana.'
       : 'Nenhuma call registrada ainda.';
 
-  const footer = `Conta apenas calls com ${MIN_MEMBERS}+ pessoas juntas`;
+  const footer = `Conta apenas quem ficou ${MIN_MEMBER_MINUTES}+ min em calls com ${MIN_MEMBERS}+ pessoas`;
   return new EmbedBuilder()
     .setTitle(period ? '📅 Ranking de calls (semanal)' : '🏆 Ranking de calls (all time)')
     .setDescription(description)
@@ -265,7 +298,7 @@ client.once(Events.ClientReady, async () => {
     active.set(o.channel_id, {
       guildId: o.guild_id,
       start: o.start_ms,
-      members: new Set(JSON.parse(o.members)),
+      members: parseMembers(o.members, o.start_ms),
     });
     const stale = Date.now() - o.heartbeat_ms > RESUME_WINDOW_MS;
     const channelExists = client.channels.cache.has(o.channel_id);
