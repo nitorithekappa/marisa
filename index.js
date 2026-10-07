@@ -32,6 +32,8 @@ const TOP_WEEKLY = 10;
 const MIN_SESSION_MS = 60 * 1000; // ignora sessões com menos de 1 minuto
 const MIN_MEMBER_MINUTES = parseInt(process.env.MIN_MEMBER_MINUTES || '30', 10);
 const MIN_MEMBER_MS = MIN_MEMBER_MINUTES * 60 * 1000; // tempo mínimo de cada pessoa na call para contar
+const END_GRACE_MINUTES = parseInt(process.env.END_GRACE_MINUTES || '5', 10);
+const END_GRACE_MS = END_GRACE_MINUTES * 60 * 1000; // call só termina após ficar esse tempo com menos de MIN_MEMBERS
 const RESUME_WINDOW_MS = 5 * 60 * 1000; // retoma sessão se o bot voltou em até 5 min
 
 if (!TOKEN) {
@@ -87,8 +89,9 @@ const topSessionsBetween = db.prepare(
 );
 
 // ───────────── Sessões em memória ─────────────
-// channelId -> { guildId, start, members:Map<userId, { ms, since }> }
+// channelId -> { guildId, start, members:Map<userId, { ms, since }>, belowSince }
 // ms = tempo acumulado na call; since = desde quando está na call agora (null se saiu)
+// belowSince = desde quando a call está com menos de MIN_MEMBERS (null se está cheia)
 const active = new Map();
 
 function serializeMembers(members) {
@@ -103,7 +106,7 @@ function parseMembers(json, fallbackStart) {
 }
 
 function memberTime(m, at) {
-  return m.ms + (m.since !== null ? at - m.since : 0);
+  return m.ms + (m.since !== null ? Math.max(0, at - m.since) : 0);
 }
 
 // ids de quem ficou pelo menos MIN_MEMBER_MS na call, do maior tempo para o menor
@@ -141,26 +144,37 @@ function updateChannel(channel) {
   const humans = channel.members.filter((m) => !m.user.bot);
   let s = active.get(channel.id);
 
-  if (humans.size >= MIN_MEMBERS) {
-    const now = Date.now();
-    if (!s) {
-      s = { guildId: channel.guild.id, start: now, members: new Map() };
-      active.set(channel.id, s);
+  const full = humans.size >= MIN_MEMBERS;
+  if (!s && !full) return;
+
+  const now = Date.now();
+  if (!s) {
+    s = { guildId: channel.guild.id, start: now, members: new Map(), belowSince: null };
+    active.set(channel.id, s);
+  }
+  // abaixo do mínimo: não encerra na hora, espera END_GRACE_MS (ver checkGraceExpired)
+  if (full) s.belowSince = null;
+  else if (s.belowSince == null) s.belowSince = now;
+
+  humans.forEach((m) => {
+    const entry = s.members.get(m.id);
+    if (!entry) s.members.set(m.id, { ms: 0, since: now });
+    else if (entry.since === null) entry.since = now; // voltou para a call
+  });
+  for (const [id, entry] of s.members) {
+    if (entry.since !== null && !humans.has(id)) {
+      entry.ms += now - entry.since; // saiu da call
+      entry.since = null;
     }
-    humans.forEach((m) => {
-      const entry = s.members.get(m.id);
-      if (!entry) s.members.set(m.id, { ms: 0, since: now });
-      else if (entry.since === null) entry.since = now; // voltou para a call
-    });
-    for (const [id, entry] of s.members) {
-      if (entry.since !== null && !humans.has(id)) {
-        entry.ms += now - entry.since; // saiu da call
-        entry.since = null;
-      }
-    }
-    persistActive(channel.id);
-  } else if (s) {
-    endSession(channel.id);
+  }
+  persistActive(channel.id);
+}
+
+// Encerra as calls que ficaram abaixo do mínimo por mais de END_GRACE_MS.
+// A call termina no momento em que caiu abaixo do mínimo.
+function checkGraceExpired(now = Date.now()) {
+  for (const [channelId, s] of active) {
+    if (s.belowSince != null && now - s.belowSince >= END_GRACE_MS) endSession(channelId, s.belowSince);
   }
 }
 
@@ -333,6 +347,7 @@ client.once(Events.ClientReady, async () => {
       guildId: o.guild_id,
       start: o.start_ms,
       members: parseMembers(o.members, o.start_ms),
+      belowSince: null,
     });
     const stale = Date.now() - o.heartbeat_ms > RESUME_WINDOW_MS;
     const channelExists = client.channels.cache.has(o.channel_id);
@@ -349,6 +364,9 @@ client.once(Events.ClientReady, async () => {
     const now = Date.now();
     for (const channelId of active.keys()) touchActive.run(now, channelId);
   }, 60 * 1000);
+
+  // Encerra calls que ficaram abaixo do mínimo por mais que a tolerância
+  setInterval(checkGraceExpired, 15 * 1000);
 
   // Ranking semanal automático
   if (RANKING_CHANNEL_ID) {
